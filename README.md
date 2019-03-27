@@ -1,2 +1,2 @@
 # Kdeploy
-Kinesis streams  and DMS Infrastructure
+cloud formation template for Kinesis streams and DMS Infrastructure 
