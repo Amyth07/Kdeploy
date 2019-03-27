@@ -1,0 +1,443 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  Service:
+    Description: >-
+      The name of the service
+    Type: String
+    Default: dms-cluster
+  Stage:
+    Description: The stage for this project
+    Type: String
+    Default: 'dev'
+    AllowedValues: [ 'dev', 'int', 'iuat', 'iprod' ]
+  SourceHost:
+    Type: String
+    Description: Location of Oracle source database
+  SourceUsername:
+    Type: String
+    Description: Service user for Oracle source database
+  SourcePassword:
+    Type: String
+    NoEcho: true
+  SourcePort:
+    Type: Number
+    Default: 1521
+  SourceDatabaseName:
+    Type: String
+    Description: This will be used as service name or SID for Oracle
+  ShardCount:
+    Type: Number
+    Default: 1
+    Description: Number of shards for the target kinesis stream
+  TargetSchema :
+    Type: String
+    Description: Name of the Target Schema 
+    Default: 'DMS_SERVICE'
+  ControlSchema :
+    Type: String
+    Description: Name of the Control Schema 
+    Default: ''
+  UpstreamSchema :
+    Type: String
+    Description: Name of the Upstream Schema for Kinesis
+    Default: 'DMS_SERVICE'
+
+Resources:
+
+##############################################################################
+# Retrieve custom mappings for this environment and region.
+##############################################################################
+
+  CustomMapping:
+    Type: Custom::Lookup
+    Properties:
+      ServiceToken:
+        !Join
+        - ':'
+        - - 'arn:aws:lambda'
+          - !Ref 'AWS::Region'
+          - !Ref 'AWS::AccountId'
+          - 'function:liveservices-environment-mappings-lambda'
+      environment: !Ref Stage
+      region: !Ref 'AWS::Region'
+
+  KinesisRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+          - Action: ["sts:AssumeRole"]
+            Effect: Allow
+            Principal:
+              Service:
+              - !Sub 'dms.${AWS::URLSuffix}'
+          Version: "2012-10-17"
+        Path: /
+        Policies:
+        - PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  -  "kinesis:DescribeStream"
+                  -  "kinesis:PutRecord"
+                  -  "kinesis:PutRecords" 
+                Resource: !GetAtt KinesisStream.Arn
+            Version: "2012-10-17"
+          PolicyName: !Sub ${Service}-KinesisPolicy
+
+  S3Role:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+          - Action: ["sts:AssumeRole"]
+            Effect: Allow
+            Principal:
+              Service:
+              - !Sub 'dms.${AWS::URLSuffix}'
+          Version: "2012-10-17"
+        Path: /
+        Policies:
+        - PolicyName: !Sub ${Service}-S3Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+              - "s3:PutAccountPublicAccessBlock"
+              - "s3:GetAccountPublicAccessBlock"
+              - "s3:ListAllMyBuckets"
+              - "s3:HeadBucket"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+              - s3:*  
+              Resource: 
+              - !GetAtt S3Bucket.Arn
+              - Fn::Join:
+                - ""
+                - - !GetAtt S3Bucket.Arn
+                  - /*
+
+
+  KinesisStream:
+    Type: "AWS::Kinesis::Stream" 
+    Properties: 
+      Name: !Sub ${Service}-stream-${Stage}
+      RetentionPeriodHours: 24
+      ShardCount: !Ref ShardCount
+      StreamEncryption: 
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+
+  ReplicationInstance:
+    Type: AWS::DMS::ReplicationInstance
+    Properties:
+      ReplicationInstanceIdentifier: !Sub ${Service}-${Stage}
+      # If increasing, must do so by at least 10% or AWS errors
+      AllocatedStorage: 50
+      AutoMinorVersionUpgrade: false
+      EngineVersion: '3.1.2'
+      MultiAZ: false
+      PubliclyAccessible: false
+      ReplicationInstanceClass: 'dms.t2.medium'
+      ReplicationSubnetGroupIdentifier: !Join [ '-', [ 'default' , !GetAtt CustomMapping.vpc ] ]
+
+  OracleSourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${Service}-oracle-source-${Stage}
+      EndpointType: source
+      EngineName: oracle
+      ExtraConnectionAttributes: 'addSupplementalLogging=Y'
+      ServerName: !Ref SourceHost
+      DatabaseName: !Ref SourceDatabaseName
+      Port: !Ref SourcePort
+      SslMode: none
+      Username: !Ref SourceUsername
+      Password: !Ref SourcePassword
+
+  KinesisTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${Service}-kinesis-target-${Stage}
+      EndpointType: target
+      EngineName: kinesis      
+      KinesisSettings:
+        StreamArn: !GetAtt KinesisStream.Arn 
+        ServiceAccessRoleArn: !GetAtt KinesisRole.Arn
+        MessageFormat: json
+
+  OracleToKinesisReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub ${Service}-oracle-kinesis-${Stage}
+      SourceEndpointArn: !Ref OracleSourceEndpoint
+      TargetEndpointArn: !Ref KinesisTargetEndpoint
+      ReplicationInstanceArn: !Ref ReplicationInstance
+      MigrationType: "cdc"
+      ReplicationTaskSettings: !Sub 
+        >-
+        {
+          "TargetMetadata": {
+            "TargetSchema": "${TargetSchema}",
+            "SupportLobs": true,
+            "FullLobMode": false,
+            "LobChunkSize": 0,
+            "LimitedSizeLobMode": true,
+            "LobMaxSize": 32,
+            "InlineLobMaxSize": 0,
+            "LoadMaxFileSize": 0,
+            "ParallelLoadThreads": 0,
+            "ParallelLoadBufferSize": 0,
+            "BatchApplyEnabled": false,
+            "TaskRecoveryTableEnabled": false
+          },
+          "FullLoadSettings": {
+            "TargetTablePrepMode": "DO_NOTHING",
+            "CreatePkAfterFullLoad": false,
+            "StopTaskCachedChangesApplied": false,
+            "StopTaskCachedChangesNotApplied": false,
+            "MaxFullLoadSubTasks": 8,
+            "TransactionConsistencyTimeout": 600,
+            "CommitRate": 10000
+          },
+          "Logging": {
+            "EnableLogging": true,
+            "LogComponents": [
+              {
+                "Id": "SOURCE_UNLOAD",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              },
+              {
+                "Id": "TARGET_LOAD",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              },
+              {
+                "Id": "SOURCE_CAPTURE",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              },
+              {
+                "Id": "TARGET_APPLY",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              },
+              {
+                "Id": "TASK_MANAGER",
+                "Severity": "LOGGER_SEVERITY_DEFAULT"
+              }
+            ]
+          },
+          "ControlTablesSettings": {
+            "historyTimeslotInMinutes": 5,
+            "ControlSchema": "${ControlSchema}",
+            "HistoryTimeslotInMinutes": 5,
+            "HistoryTableEnabled": false,
+            "SuspendedTablesTableEnabled": false,
+            "StatusTableEnabled": false
+          },
+          "StreamBufferSettings": {
+            "StreamBufferCount": 3,
+            "StreamBufferSizeInMB": 8,
+            "CtrlStreamBufferSizeInMB": 5
+          },
+          "ChangeProcessingDdlHandlingPolicy": {
+            "HandleSourceTableDropped": true,
+            "HandleSourceTableTruncated": true,
+            "HandleSourceTableAltered": true
+          },
+          "ErrorBehavior": {
+            "DataErrorPolicy": "LOG_ERROR",
+            "DataTruncationErrorPolicy": "LOG_ERROR",
+            "DataErrorEscalationPolicy": "SUSPEND_TABLE",
+            "DataErrorEscalationCount": 0,
+            "TableErrorPolicy": "SUSPEND_TABLE",
+            "TableErrorEscalationPolicy": "STOP_TASK",
+            "TableErrorEscalationCount": 0,
+            "RecoverableErrorCount": -1,
+            "RecoverableErrorInterval": 5,
+            "RecoverableErrorThrottling": true,
+            "RecoverableErrorThrottlingMax": 1800,
+            "ApplyErrorDeletePolicy": "IGNORE_RECORD",
+            "ApplyErrorInsertPolicy": "LOG_ERROR",
+            "ApplyErrorUpdatePolicy": "LOG_ERROR",
+            "ApplyErrorEscalationPolicy": "LOG_ERROR",
+            "ApplyErrorEscalationCount": 0,
+            "ApplyErrorFailOnTruncationDdl": false,
+            "FullLoadIgnoreConflicts": true,
+            "FailOnTransactionConsistencyBreached": false,
+            "FailOnNoTablesCaptured": false
+          },
+          "ChangeProcessingTuning": {
+            "BatchApplyPreserveTransaction": true,
+            "BatchApplyTimeoutMin": 1,
+            "BatchApplyTimeoutMax": 30,
+            "BatchApplyMemoryLimit": 500,
+            "BatchSplitSize": 0,
+            "MinTransactionSize": 1000,
+            "CommitTimeout": 1,
+            "MemoryLimitTotal": 1024,
+            "MemoryKeepTime": 60,
+            "StatementCacheSize": 50
+          },
+          "PostProcessingRules": null
+        } 
+
+      TableMappings: !Sub 
+        >-
+        {"rules": [{"rule-type": "selection", "rule-id": "1", "rule-name": "1", "object-locator": {"schema-name": "${UpstreamSchema}", "table-name": "%WELL"}, "rule-action": "include"}, {"rule-type": "selection", "rule-id": "2", "rule-name": "2", "object-locator": {"schema-name": "${UpstreamSchema}", "table-name": "WELL_INTEREST"}, "rule-action": "include"}]}
+      
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Service}-${Stage}
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  OracleTargetEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${Service}-oracle-target-${Stage}
+      EndpointType: target
+      EngineName: oracle
+      ExtraConnectionAttributes: 'addSupplementalLogging=Y'
+      ServerName: !Ref SourceHost
+      DatabaseName: !Ref SourceDatabaseName
+      Port: !Ref SourcePort
+      SslMode: none
+      Username: !Ref SourceUsername
+      Password: !Ref SourcePassword
+
+  S3SourceEndpoint:
+    Type: AWS::DMS::Endpoint
+    Properties:
+      EndpointIdentifier: !Sub ${Service}-S3-Source-${Stage}
+      EndpointType: source
+      ExtraConnectionAttributes: compressionType=NONE;csvDelimiter=,;csvRowDelimiter=\n;cdcPath=changes
+      EngineName: s3      
+      S3Settings:
+        BucketName: !Ref S3Bucket
+        ExternalTableDefinition: '{"TableCount": 1, "Tables": [{"TableColumns": [{"ColumnIsPk": true, "ColumnLength": 2, "ColumnName": "UCOU_CODE", "ColumnNullable": false, "ColumnType": "STRING"}, {"ColumnIsPk": true, "ColumnLength": 25, "ColumnName": "UWEL_NAME", "ColumnNullable": false, "ColumnType": "STRING"}, {"ColumnIsPk": true, "ColumnName": "UWEL_RE_ENTRY", "ColumnNullable": false, "ColumnType": "INT8"}, {"ColumnIsPk": false, "ColumnName": "INSTANCE_S", "ColumnNullable": false, "ColumnType": "INT8"}, {"ColumnIsPk": false, "ColumnLength": 1, "ColumnName": "UWEL_CALC_ELEVATION", "ColumnNullable": false, "ColumnType": "STRING"}, {"ColumnIsPk": false, "ColumnLength": 6, "ColumnName": "UWEL_CATEGORY", "ColumnNullable": false, "ColumnType": "STRING"}, {"ColumnIsPk": false, "ColumnName": "UWEL_DCOMP", "ColumnNullable": true, "ColumnType": "DATE"}, {"ColumnIsPk": false, "ColumnName": "UWEL_DSPUD", "ColumnNullable": true, "ColumnType": "DATE"}, {"ColumnIsPk": false, "ColumnLength": 8, "ColumnName": "UBAS_CODE", "ColumnNullable": true, "ColumnType": "STRING"}], "TableColumnsTotal": 9, "TableName": "UPD_WELLS", "TableOwner": "DMS_SERVICE", "TablePath": "DMS_SERVICE/UPD_WELLS/load"}]}'
+        ServiceAccessRoleArn: !GetAtt S3Role.Arn
+
+  S3ToOracleReplicationTask:
+    Type: AWS::DMS::ReplicationTask
+    Properties:
+      ReplicationTaskIdentifier: !Sub ${Service}-S3-Oracle-${Stage}
+      SourceEndpointArn: !Ref S3SourceEndpoint  
+      TargetEndpointArn: !Ref OracleTargetEndpoint
+      ReplicationInstanceArn: !Ref ReplicationInstance
+      MigrationType: "cdc"
+      ReplicationTaskSettings: !Sub 
+        >-
+        {
+              "TargetMetadata": {
+                "TargetSchema": "${TargetSchema}",
+                "SupportLobs": true,
+                "FullLobMode": false,
+                "LobChunkSize": 0,
+                "LimitedSizeLobMode": true,
+                "LobMaxSize": 32,
+                "InlineLobMaxSize": 0,
+                "LoadMaxFileSize": 0,
+                "ParallelLoadThreads": 0,
+                "ParallelLoadBufferSize": 0,
+                "BatchApplyEnabled": false,
+                "TaskRecoveryTableEnabled": false
+              },
+              "FullLoadSettings": {
+                "TargetTablePrepMode": "DO_NOTHING",
+                "CreatePkAfterFullLoad": false,
+                "StopTaskCachedChangesApplied": false,
+                "StopTaskCachedChangesNotApplied": false,
+                "MaxFullLoadSubTasks": 1,
+                "TransactionConsistencyTimeout": 600,
+                "CommitRate": 10000
+              },
+              "Logging": {
+                "EnableLogging": true,
+                "LogComponents": [
+                  {
+                    "Id": "SOURCE_UNLOAD",
+                    "Severity": "LOGGER_SEVERITY_DEFAULT"
+                  },
+                  {
+                    "Id": "TARGET_LOAD",
+                    "Severity": "LOGGER_SEVERITY_DEFAULT"
+                  },
+                  {
+                    "Id": "SOURCE_CAPTURE",
+                    "Severity": "LOGGER_SEVERITY_DEFAULT"
+                  },
+                  {
+                    "Id": "TARGET_APPLY",
+                    "Severity": "LOGGER_SEVERITY_DEFAULT"
+                  },
+                  {
+                    "Id": "TASK_MANAGER",
+                    "Severity": "LOGGER_SEVERITY_DEFAULT"
+                  }
+                ]
+              },
+              "ControlTablesSettings": {
+                "historyTimeslotInMinutes": 5,
+                "ControlSchema": "${ControlSchema}",
+                "HistoryTimeslotInMinutes": 5,
+                "HistoryTableEnabled": false,
+                "SuspendedTablesTableEnabled": false,
+                "StatusTableEnabled": true
+              },
+              "StreamBufferSettings": {
+                "StreamBufferCount": 3,
+                "StreamBufferSizeInMB": 8,
+                "CtrlStreamBufferSizeInMB": 5
+              },
+              "ChangeProcessingDdlHandlingPolicy": {
+                "HandleSourceTableDropped": true,
+                "HandleSourceTableTruncated": true,
+                "HandleSourceTableAltered": true
+              },
+              "ErrorBehavior": {
+                "DataErrorPolicy": "LOG_ERROR",
+                "DataTruncationErrorPolicy": "LOG_ERROR",
+                "DataErrorEscalationPolicy": "SUSPEND_TABLE",
+                "DataErrorEscalationCount": 0,
+                "TableErrorPolicy": "SUSPEND_TABLE",
+                "TableErrorEscalationPolicy": "STOP_TASK",
+                "TableErrorEscalationCount": 0,
+                "RecoverableErrorCount": -1,
+                "RecoverableErrorInterval": 5,
+                "RecoverableErrorThrottling": true,
+                "RecoverableErrorThrottlingMax": 1800,
+                "ApplyErrorDeletePolicy": "IGNORE_RECORD",
+                "ApplyErrorInsertPolicy": "LOG_ERROR",
+                "ApplyErrorUpdatePolicy": "LOG_ERROR",
+                "ApplyErrorEscalationPolicy": "LOG_ERROR",
+                "ApplyErrorEscalationCount": 0,
+                "ApplyErrorFailOnTruncationDdl": false,
+                "FullLoadIgnoreConflicts": true,
+                "FailOnTransactionConsistencyBreached": false,
+                "FailOnNoTablesCaptured": false
+              },
+              "ChangeProcessingTuning": {
+                "BatchApplyPreserveTransaction": true,
+                "BatchApplyTimeoutMin": 1,
+                "BatchApplyTimeoutMax": 30,
+                "BatchApplyMemoryLimit": 500,
+                "BatchSplitSize": 0,
+                "MinTransactionSize": 1000,
+                "CommitTimeout": 1,
+                "MemoryLimitTotal": 1024,
+                "MemoryKeepTime": 60,
+                "StatementCacheSize": 50
+              },
+              "PostProcessingRules": null
+            }
+      TableMappings: !Sub 
+        >-
+        {"rules": [{"rule-type": "selection", "rule-id": "1", "rule-name": "1", "object-locator": {"schema-name": "${TargetSchema}", "table-name": "UPD_WELLS"}, "rule-action": "include"}]}
+      
